@@ -1,0 +1,188 @@
+\about
+Use sales;
+-- Data Cleaning
+-- Issue 1: Currency field contains carriage return artifacts
+SELECT DISTINCT currency, Length(currency) as len
+From transactions;
+UPDATE transactions SET currency = "INR" WHERE currency = "INR\r";
+UPDATE transactions SET currency = "USD" WHERE currency = "USD\r";
+-- Issue 2: Invalid sales amounts
+SELECT sales_amount, COUNT(*) as cnt
+FROM transactions
+WHERE sales_amount <= 0
+GROUP BY sales_amount
+ORDER BY cnt DESC;
+
+CREATE VIEW clean_transactions AS
+SELECT *
+FROM transactions
+WHERE sales_amount > 0;
+-- Issue 3: Normalize USD to INR 
+SELECT currency, COUNT(*) AS tnx_count, SUM(sales_amount) as total
+FROM transactions
+GROUP BY currency;
+CREATE VIEW normalized_transactions AS
+SELECT *,
+  CASE
+    WHEN currency = 'USD' THEN sales_amount * 75
+    ELSE sales_amount
+  END AS norm_sales_amount
+FROM clean_transactions;
+
+-- Issue 4: Check duplicate
+SELECT product_code, customer_code, market_code, order_date,
+       sales_qty, sales_amount, currency, COUNT(*) AS dup_count
+FROM transactions
+GROUP BY product_code, customer_code, market_code, order_date,
+         sales_qty, sales_amount, currency
+HAVING COUNT(*) > 1;
+-- Check how many duplicates and their counts
+SELECT dup_count, COUNT(*) AS num_groups
+FROM (
+  SELECT product_code, customer_code, market_code, order_date,
+         sales_qty, sales_amount, currency, COUNT(*) AS dup_count
+  FROM clean_transactions
+  GROUP BY product_code, customer_code, market_code, order_date,
+           sales_qty, sales_amount, currency
+  HAVING COUNT(*) > 1
+) sub
+GROUP BY dup_count;
+-- Data Analysis 
+-- Q1: Revenue breakdown by city
+SELECT m.markets_name,
+       SUM(t.norm_sales_amount) AS total_revenue,
+       ROUND(SUM(t.norm_sales_amount) * 100.0 /
+             (SELECT SUM(norm_sales_amount) FROM normalized_transactions), 2) AS pct_of_total
+FROM normalized_transactions t
+JOIN markets m ON t.market_code = m.markets_code
+GROUP BY m.markets_name
+ORDER BY total_revenue DESC;
+-- Q2: Revenue by year and month
+SELECT d.year, d.month_name,
+       SUM(t.norm_sales_amount) AS monthly_revenue
+FROM normalized_transactions t
+JOIN date d ON t.order_date = d.date
+GROUP BY d.year, d.month_name
+ORDER BY d.year, FIELD(d.month_name, 'January','February','March','April','May','June',
+                       'July','August','September','October','November','December');
+-- Q3: Top 5 customers by revenue
+SELECT c.custmer_name,
+       SUM(t.norm_sales_amount) AS total_revenue,
+       SUM(t.sales_qty) AS total_qty
+FROM normalized_transactions t
+JOIN customers c ON t.customer_code = c.customer_code
+GROUP BY c.custmer_name
+ORDER BY total_revenue DESC
+LIMIT 5;
+-- Q4: Top 5 products by revenue
+SELECT t.product_code, p.product_type,
+       SUM(t.norm_sales_amount) AS total_revenue
+FROM normalized_transactions t
+JOIN products p ON t.product_code = p.product_code
+GROUP BY t.product_code, p.product_type
+ORDER BY total_revenue DESC
+LIMIT 5;
+-- Q5: Year-over-year revenue growth by market
+WITH yearly_revenue AS (
+  SELECT m.markets_name, d.year,
+         SUM(t.norm_sales_amount) AS revenue
+  FROM normalized_transactions t
+  JOIN markets m ON t.market_code = m.markets_code
+  JOIN date d ON t.order_date = d.date
+  GROUP BY m.markets_name, d.year
+)
+SELECT curr.markets_name,
+       curr.year,
+       curr.revenue AS current_year_revenue,
+       prev.revenue AS previous_year_revenue,
+       ROUND((curr.revenue - prev.revenue) * 100.0 / prev.revenue, 2) AS yoy_growth_pct
+FROM yearly_revenue curr
+LEFT JOIN yearly_revenue prev
+  ON curr.markets_name = prev.markets_name
+  AND curr.year = prev.year + 1
+WHERE prev.revenue IS NOT NULL
+ORDER BY curr.year, yoy_growth_pct;
+-- Q6: Revenue concentration risk (Pareto analysis)
+WITH customer_revenue AS (
+  SELECT c.custmer_name,
+         SUM(t.norm_sales_amount) AS revenue,
+         SUM(SUM(t.norm_sales_amount)) OVER (ORDER BY SUM(t.norm_sales_amount) DESC) AS running_total,
+         SUM(SUM(t.norm_sales_amount)) OVER () AS grand_total
+  FROM normalized_transactions t
+  JOIN customers c ON t.customer_code = c.customer_code
+  GROUP BY c.custmer_name
+)
+SELECT custmer_name, revenue,
+       ROUND(revenue * 100.0 / grand_total, 2) AS pct_of_total,
+       ROUND(running_total * 100.0 / grand_total, 2) AS cumulative_pct
+FROM customer_revenue
+ORDER BY revenue DESC
+LIMIT 10;
+-- Q7: Seasonality — which months consistently outperform?
+SELECT d.month_name,
+       ROUND(AVG(monthly_rev), 2) AS avg_monthly_revenue,
+       MIN(monthly_rev) AS worst_year,
+       MAX(monthly_rev) AS best_year
+FROM (
+  SELECT d.year, d.month_name,
+         SUM(t.norm_sales_amount) AS monthly_rev
+  FROM normalized_transactions t
+  JOIN date d ON t.order_date = d.date
+  GROUP BY d.year, d.month_name
+) sub
+JOIN date d ON sub.month_name = d.month_name
+GROUP BY d.month_name
+ORDER BY avg_monthly_revenue DESC;
+-- Q8: Customer retention — cohort analysis
+WITH first_purchase AS (
+  SELECT customer_code,
+         MIN(order_date) AS first_order,
+         YEAR(MIN(order_date)) AS cohort_year
+  FROM normalized_transactions
+  GROUP BY customer_code
+),
+cohort_activity AS (
+  SELECT fp.cohort_year,
+         d.year AS activity_year,
+         COUNT(DISTINCT t.customer_code) AS active_customers
+  FROM normalized_transactions t
+  JOIN first_purchase fp ON t.customer_code = fp.customer_code
+  JOIN date d ON t.order_date = d.date
+  GROUP BY fp.cohort_year, d.year
+)
+SELECT cohort_year, activity_year,
+       active_customers,
+       activity_year - cohort_year AS years_since_first_purchase
+FROM cohort_activity
+ORDER BY cohort_year, activity_year;
+-- How many unique customers, and when did they start?
+SELECT cohort_year, COUNT(*) AS num_customers
+FROM (
+  SELECT customer_code,
+         YEAR(MIN(order_date)) AS cohort_year
+  FROM normalized_transactions
+  GROUP BY customer_code
+) sub
+GROUP BY cohort_year;
+-- Q9: Customer-product matrix — which products sell where?
+SELECT m.markets_name, p.product_type,
+       COUNT(DISTINCT t.product_code) AS unique_products,
+       SUM(t.norm_sales_amount) AS revenue
+FROM normalized_transactions t
+JOIN markets m ON t.market_code = m.markets_code
+JOIN products p ON t.product_code = p.product_code
+GROUP BY m.markets_name, p.product_type
+ORDER BY m.markets_name, revenue DESC;
+-- Q10: Anomaly detection — suspicious transactions
+WITH stats AS (
+  SELECT AVG(norm_sales_amount) AS avg_amount,
+         STDDEV(norm_sales_amount) AS std_amount
+  FROM normalized_transactions
+)
+SELECT t.product_code, t.customer_code, t.market_code,
+       t.order_date, t.sales_qty, t.norm_sales_amount,
+       ROUND((t.norm_sales_amount - s.avg_amount) / s.std_amount, 2) AS z_score
+FROM normalized_transactions t
+CROSS JOIN stats s
+WHERE ABS((t.norm_sales_amount - s.avg_amount) / s.std_amount) > 3
+ORDER BY z_score DESC;
